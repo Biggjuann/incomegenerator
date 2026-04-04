@@ -153,8 +153,55 @@ def run_backtest(data: dict, start_date: pd.Timestamp, end_date: pd.Timestamp | 
 
     df = pd.DataFrame(records).set_index("date")
 
-    # Monthly income aggregation
-    monthly_income = df["daily_income"].resample("ME").sum()
+    # Monthly income aggregation (raw — spiky due to quarterly payers)
+    monthly_income_raw = df["daily_income"].resample("ME").sum()
+    monthly_income_raw.name = "monthly_income_raw"
+
+    # ------------------------------------------------------------------
+    # INCOME SMOOTHING RESERVOIR
+    # ------------------------------------------------------------------
+    # Simulates what a retiree would actually do: all dividends flow into
+    # a reservoir, and a steady monthly withdrawal is taken.  The
+    # withdrawal amount is re-calibrated every 12 months based on the
+    # trailing 3-month average inflow (conservative) to keep the
+    # reservoir solvent while maximizing the paycheck.
+    # ------------------------------------------------------------------
+    reservoir = 0.0
+    smoothed_values = []
+    monthly_withdrawal = 0.0
+    calibration_months = 0
+
+    for i, (month_end, raw_income) in enumerate(monthly_income_raw.items()):
+        reservoir += raw_income
+
+        # Initial calibration: after first 3 months, set withdrawal
+        if i == 2 and monthly_withdrawal == 0:
+            monthly_withdrawal = monthly_income_raw.iloc[:3].mean() * 0.90  # 10% safety margin
+            calibration_months = 0
+
+        # Re-calibrate every 12 months using trailing 3-month avg
+        calibration_months += 1
+        if calibration_months >= 12 and i >= 3:
+            trailing_3m_avg = monthly_income_raw.iloc[max(0, i - 2) : i + 1].mean()
+            monthly_withdrawal = trailing_3m_avg * 0.90  # 10% safety margin
+            calibration_months = 0
+
+        # Withdraw from reservoir (can't withdraw more than what's there)
+        actual_withdrawal = min(monthly_withdrawal, reservoir) if monthly_withdrawal > 0 else raw_income
+        reservoir -= actual_withdrawal
+
+        smoothed_values.append(
+            {
+                "month": month_end,
+                "raw_income": raw_income,
+                "smoothed_income": actual_withdrawal,
+                "reservoir_balance": reservoir,
+                "withdrawal_rate": monthly_withdrawal,
+            }
+        )
+
+    smoothed_df = pd.DataFrame(smoothed_values).set_index("month")
+    monthly_income = smoothed_df["smoothed_income"]
     monthly_income.name = "monthly_income"
 
     # Per-ETF dividend detail
@@ -179,6 +226,8 @@ def run_backtest(data: dict, start_date: pd.Timestamp, end_date: pd.Timestamp | 
     return {
         "df": df,
         "monthly_income": monthly_income,
+        "monthly_income_raw": monthly_income_raw,
+        "smoothed_df": smoothed_df,
         "etf_dividend_detail": etf_dividend_detail,
         "income_tickers": income_tickers,
         "spy_shares_final": spy_shares,
@@ -241,6 +290,8 @@ def main():
 
     df = results["df"]
     monthly_income = results["monthly_income"]
+    monthly_income_raw = results["monthly_income_raw"]
+    smoothed_df = results["smoothed_df"]
     detail = results["etf_dividend_detail"]
     income_tickers = results["income_tickers"]
 
@@ -261,6 +312,13 @@ def main():
     spy_growth = (final_spy - STARTING_CAPITAL * SPY_ALLOCATION) / (STARTING_CAPITAL * SPY_ALLOCATION) * 100
     spy_cagr = ((final_spy / (STARTING_CAPITAL * SPY_ALLOCATION)) ** (1 / years) - 1) * 100 if years > 0 else 0
 
+    # Income stability metrics
+    income_min = monthly_income.min()
+    income_max = monthly_income.max()
+    income_std = monthly_income.std()
+    income_cv = (income_std / avg_monthly * 100) if avg_monthly > 0 else 0
+    reservoir_balance = smoothed_df["reservoir_balance"].iloc[-1]
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Portfolio Value", fmt_money(final_total + total_income))
     col2.metric("SPY Sleeve (Inheritance)", fmt_money(final_spy), f"{fmt_pct(spy_growth)} total")
@@ -268,10 +326,19 @@ def main():
     col4.metric("Total Income Collected", fmt_money(total_income))
 
     col5, col6, col7, col8 = st.columns(4)
-    col5.metric("Avg Monthly Income", fmt_money(avg_monthly))
-    col6.metric("Latest Month Income", fmt_money(latest_monthly))
+    col5.metric("Steady Monthly Paycheck", fmt_money(avg_monthly))
+    col6.metric("Latest Month Paycheck", fmt_money(latest_monthly))
     col7.metric("SPY CAGR (w/ reinvested divs)", fmt_pct(spy_cagr))
     col8.metric("Total Return (incl. income)", fmt_pct(total_return))
+
+    # Income stability row
+    st.divider()
+    st.subheader("Income Stability (Smoothed Paycheck)")
+    stab1, stab2, stab3, stab4 = st.columns(4)
+    stab1.metric("Lowest Monthly Paycheck", fmt_money(income_min))
+    stab2.metric("Highest Monthly Paycheck", fmt_money(income_max))
+    stab3.metric("Income Variability (CV)", fmt_pct(income_cv), help="Coefficient of variation — lower is more stable. Under 15% is good.")
+    stab4.metric("Reservoir Buffer Balance", fmt_money(reservoir_balance), help="Cash cushion built up from quarterly dividend spikes")
 
     st.divider()
 
@@ -313,35 +380,66 @@ def main():
     fig_growth.update_yaxes(title_text="Cumulative Income ($)", secondary_y=True, tickformat="$,.0f")
     st.plotly_chart(fig_growth, use_container_width=True)
 
-    # ---- Monthly Income Bar Chart ----
-    st.header("Monthly Retirement Income")
+    # ---- Monthly Income Bar Chart: Raw vs Smoothed ----
+    st.header("Monthly Retirement Income — Raw vs Smoothed Paycheck")
+    st.markdown(
+        """
+        > **The problem**: SCHD, VYM, HDV, and SDIV pay dividends **quarterly** (Mar/Jun/Sep/Dec),
+        > creating huge spikes in those months and near-zero income in between. That's not livable.
+        >
+        > **The fix**: All dividends flow into a **reservoir** (cash buffer). You withdraw a **steady
+        > monthly paycheck** that's recalibrated annually. The grey bars below show the raw spiky
+        > dividends; the green bars show your actual smooth paycheck.
+        """
+    )
 
     fig_monthly = go.Figure()
+    # Raw income (faded background)
+    fig_monthly.add_trace(
+        go.Bar(
+            x=monthly_income_raw.index,
+            y=monthly_income_raw.values,
+            marker_color="rgba(180,180,180,0.45)",
+            name="Raw Dividends Received",
+        )
+    )
+    # Smoothed paycheck (foreground)
     fig_monthly.add_trace(
         go.Bar(
             x=monthly_income.index,
             y=monthly_income.values,
             marker_color="#2ca02c",
-            name="Monthly Income",
-        )
-    )
-    # Rolling 12-month average
-    rolling_avg = monthly_income.rolling(12).mean()
-    fig_monthly.add_trace(
-        go.Scatter(
-            x=rolling_avg.index,
-            y=rolling_avg.values,
-            name="12-Month Rolling Avg",
-            line=dict(color="#d62728", width=2.5),
+            name="Your Monthly Paycheck (Smoothed)",
         )
     )
     fig_monthly.update_layout(
-        height=400,
+        height=450,
         yaxis_tickformat="$,.0f",
+        barmode="overlay",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig_monthly, use_container_width=True)
+
+    # ---- Reservoir Balance Chart ----
+    st.subheader("Income Reservoir Balance Over Time")
+    st.markdown("This is your cash buffer — dividends flow in, steady paychecks flow out. A positive balance means you have a safety cushion.")
+    fig_reservoir = go.Figure()
+    fig_reservoir.add_trace(
+        go.Scatter(
+            x=smoothed_df.index,
+            y=smoothed_df["reservoir_balance"],
+            fill="tozeroy",
+            line=dict(color="#1f77b4", width=2),
+            name="Reservoir Balance",
+        )
+    )
+    fig_reservoir.update_layout(
+        height=300,
+        yaxis_tickformat="$,.0f",
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_reservoir, use_container_width=True)
 
     # ---- Income by ETF stacked area ----
     st.header("Monthly Income Breakdown by ETF")
@@ -404,15 +502,20 @@ def main():
     df_annual["year"] = df_annual.index.year
     annual_rows = []
     for year, grp in df_annual.groupby("year"):
-        yr_income = grp["daily_income"].sum()
+        yr_income_raw = grp["daily_income"].sum()
+        # Smoothed income for this year
+        yr_smoothed = smoothed_df.loc[smoothed_df.index.year == year, "smoothed_income"]
+        yr_smoothed_total = yr_smoothed.sum() if len(yr_smoothed) > 0 else 0
+        yr_smoothed_monthly = yr_smoothed.mean() if len(yr_smoothed) > 0 else 0
         annual_rows.append(
             {
                 "Year": int(year),
                 "SPY Sleeve": fmt_money(grp["spy_value"].iloc[-1]),
                 "Income Sleeve": fmt_money(grp["income_sleeve_value"].iloc[-1]),
                 "Total Portfolio": fmt_money(grp["total_portfolio_value"].iloc[-1]),
-                "Annual Income": fmt_money(yr_income),
-                "Monthly Avg Income": fmt_money(yr_income / max(grp.index.month.nunique(), 1)),
+                "Raw Annual Income": fmt_money(yr_income_raw),
+                "Smoothed Annual Income": fmt_money(yr_smoothed_total),
+                "Monthly Paycheck": fmt_money(yr_smoothed_monthly),
                 "Cumulative Income": fmt_money(grp["cumulative_income"].iloc[-1]),
             }
         )
@@ -474,6 +577,7 @@ def main():
     # =====================================================================
     st.divider()
     st.header("Strategy Summary")
+    raw_avg = monthly_income_raw.mean()
     st.markdown(
         f"""
         | Metric | Value |
@@ -484,8 +588,11 @@ def main():
         | **SPY CAGR** | {fmt_pct(spy_cagr)} |
         | **Income Sleeve Current Value** | {fmt_money(final_income_sleeve)} |
         | **Total Retirement Income Collected** | {fmt_money(total_income)} |
-        | **Average Monthly Income** | {fmt_money(avg_monthly)} |
-        | **Latest Month Income** | {fmt_money(latest_monthly)} |
+        | **Avg Raw Monthly Dividends** | {fmt_money(raw_avg)} |
+        | **Avg Smoothed Monthly Paycheck** | {fmt_money(avg_monthly)} |
+        | **Lowest Monthly Paycheck** | {fmt_money(income_min)} |
+        | **Income Variability (CV)** | {fmt_pct(income_cv)} |
+        | **Reservoir Buffer** | {fmt_money(reservoir_balance)} |
         | **Total Wealth Created** | {fmt_money(final_total + total_income)} |
         | **Total Return** | {fmt_pct(total_return)} |
         """
