@@ -32,8 +32,10 @@ STARTING_CAPITAL = 3_000_000
 SPY_ALLOCATION = 0.50
 INCOME_ALLOCATION = 0.50
 
-# Income ETFs — equal-weight within the income sleeve
-INCOME_ETFS = ["SCHD", "VYM", "HDV", "JEPI", "QYLD", "SDIV"]
+# Income ETFs grouped by payout frequency
+MONTHLY_ETFS = ["JEPI", "QYLD", "SDIV"]   # pay monthly — steady income
+QUARTERLY_ETFS = ["SCHD", "VYM", "HDV"]    # pay quarterly — growth + dividends
+INCOME_ETFS = QUARTERLY_ETFS + MONTHLY_ETFS
 
 ALL_TICKERS = ["SPY"] + INCOME_ETFS
 
@@ -146,15 +148,20 @@ def find_common_start(data: dict) -> pd.Timestamp:
 # ---------------------------------------------------------------------------
 # Backtest engine
 # ---------------------------------------------------------------------------
-def run_backtest(data: dict, start_date: pd.Timestamp, end_date: pd.Timestamp | None = None):
+def run_backtest(data: dict, start_date: pd.Timestamp, monthly_pct: float = 50.0, end_date: pd.Timestamp | None = None):
     """
     Run the backtest.
 
     SPY sleeve:  dividends are REINVESTED (compounding for inheritance).
     Income sleeve: dividends are PAID OUT as retirement income.
+
+    monthly_pct: % of the income sleeve allocated to monthly-paying ETFs
+                 (remainder goes to quarterly-paying ETFs). Default 50%.
     """
     tickers_available = [t for t in ALL_TICKERS if t in data]
     income_tickers = [t for t in INCOME_ETFS if t in data]
+    monthly_tickers = [t for t in MONTHLY_ETFS if t in data]
+    quarterly_tickers = [t for t in QUARTERLY_ETFS if t in data]
 
     if "SPY" not in tickers_available or len(income_tickers) == 0:
         st.error("Not enough ticker data to run backtest.")
@@ -171,17 +178,27 @@ def run_backtest(data: dict, start_date: pd.Timestamp, end_date: pd.Timestamp | 
         all_dates = idx if all_dates is None else all_dates.union(idx)
     all_dates = all_dates.sort_values()
 
-    # ---- Initial share purchases ----
+    # ---- Initial share purchases (weighted by monthly vs quarterly split) ----
     spy_capital = STARTING_CAPITAL * SPY_ALLOCATION
-    income_capital_per_etf = (STARTING_CAPITAL * INCOME_ALLOCATION) / len(income_tickers)
+    total_income_capital = STARTING_CAPITAL * INCOME_ALLOCATION
+
+    monthly_capital = total_income_capital * (monthly_pct / 100.0)
+    quarterly_capital = total_income_capital * (1 - monthly_pct / 100.0)
+
+    # Equal-weight within each group
+    capital_per_monthly = monthly_capital / max(len(monthly_tickers), 1)
+    capital_per_quarterly = quarterly_capital / max(len(quarterly_tickers), 1)
 
     spy_price_0 = data["SPY"]["close"].loc[start_date:].iloc[0]
     spy_shares = spy_capital / spy_price_0
 
     income_shares = {}
+    etf_capital = {}
     for t in income_tickers:
         p0 = data[t]["close"].loc[start_date:].iloc[0]
-        income_shares[t] = income_capital_per_etf / p0
+        cap = capital_per_monthly if t in monthly_tickers else capital_per_quarterly
+        income_shares[t] = cap / p0
+        etf_capital[t] = cap
 
     # ---- Daily simulation ----
     records = []
@@ -295,6 +312,8 @@ def run_backtest(data: dict, start_date: pd.Timestamp, end_date: pd.Timestamp | 
                 "total_dividends": payouts.sum(),
                 "avg_monthly": payouts.resample("ME").sum().mean(),
                 "shares": income_shares[t],
+                "capital_allocated": etf_capital[t],
+                "frequency": "Monthly" if t in MONTHLY_ETFS else "Quarterly",
                 "yield_on_cost": divs.sum() / data[t]["close"].loc[start_date:].iloc[0] * 100,
                 "monthly_series": payouts.resample("ME").sum(),
             }
@@ -310,6 +329,7 @@ def run_backtest(data: dict, start_date: pd.Timestamp, end_date: pd.Timestamp | 
         "smoothed_df": smoothed_df,
         "etf_dividend_detail": etf_dividend_detail,
         "income_tickers": income_tickers,
+        "monthly_pct": monthly_pct,
         "spy_shares_final": spy_shares,
         "spy_shares_initial": spy_capital / spy_price_0,
         "spy_divs_reinvested": cumulative_spy_divs_reinvested,
@@ -363,8 +383,29 @@ def main():
         bt_start = st.sidebar.date_input("Start date", value=common_start, min_value=common_start)
         bt_start = pd.Timestamp(bt_start)
 
+    st.sidebar.divider()
+    st.sidebar.header("Income Allocation Mix")
+    st.sidebar.markdown(
+        "**Monthly payers** (JEPI, QYLD, SDIV) provide steady monthly income. "
+        "**Quarterly payers** (SCHD, VYM, HDV) offer better growth but spiky payouts."
+    )
+    monthly_pct = st.sidebar.slider(
+        "% of income sleeve to monthly payers",
+        min_value=0, max_value=100, value=70, step=5,
+        help="Higher = smoother monthly income. Lower = more growth-oriented dividends."
+    )
+    quarterly_pct = 100 - monthly_pct
+    st.sidebar.markdown(
+        f"**{monthly_pct}%** to monthly ETFs (JEPI, QYLD, SDIV) = "
+        f"**{fmt_money(STARTING_CAPITAL * INCOME_ALLOCATION * monthly_pct / 100)}**"
+    )
+    st.sidebar.markdown(
+        f"**{quarterly_pct}%** to quarterly ETFs (SCHD, VYM, HDV) = "
+        f"**{fmt_money(STARTING_CAPITAL * INCOME_ALLOCATION * quarterly_pct / 100)}**"
+    )
+
     # Run backtest
-    results = run_backtest(data, bt_start)
+    results = run_backtest(data, bt_start, monthly_pct=monthly_pct)
     if results is None:
         return
 
@@ -564,6 +605,8 @@ def main():
             rows.append(
                 {
                     "ETF": t,
+                    "Frequency": d["frequency"],
+                    "Capital Allocated": fmt_money(d["capital_allocated"]),
                     "Shares Held": f"{d['shares']:,.2f}",
                     "Total Dividends Received": fmt_money(d["total_dividends"]),
                     "Avg Monthly Income": fmt_money(d["avg_monthly"]),
