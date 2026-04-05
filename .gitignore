@@ -1,5 +1,4 @@
 __pycache__/
 *.pyc
-.streamlit/
 *.png
 dashboard_preview.html
