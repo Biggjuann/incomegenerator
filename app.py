@@ -43,6 +43,11 @@ def fmt_money(val):
     return f"${val:,.0f}"
 
 
+def fmt_money_md(val):
+    """Money format escaped for Streamlit markdown ($ triggers LaTeX)."""
+    return f"\\${val:,.0f}"
+
+
 def fmt_pct(val):
     return f"{val:,.2f}%"
 
@@ -590,24 +595,150 @@ def main():
     st.divider()
     st.header("Strategy Summary")
     raw_avg = monthly_income_raw.mean()
+    m = fmt_money_md
     st.markdown(
         f"""
         | Metric | Value |
         |--------|-------|
-        | **Starting Capital** | {fmt_money(STARTING_CAPITAL)} |
+        | **Starting Capital** | {m(STARTING_CAPITAL)} |
         | **Backtest Period** | {results['start_date'].strftime('%Y-%m-%d')} to {results['end_date'].strftime('%Y-%m-%d')} ({years:.1f} years) |
-        | **Growth Sleeve (Inheritance)** | {fmt_money(final_growth)} |
+        | **Growth Sleeve (Inheritance)** | {m(final_growth)} |
         | **Growth CAGR** | {fmt_pct(growth_cagr)} |
-        | **Income Sleeve Value** | {fmt_money(final_income_sleeve)} |
-        | **Div Growth Sleeve Value** | {fmt_money(final_dvg)} |
-        | **Total Income Collected** | {fmt_money(total_income_paid)} |
-        | **Avg Monthly Paycheck** | {fmt_money(avg_monthly)} |
-        | **Lowest Monthly Paycheck** | {fmt_money(income_min)} |
+        | **Income Sleeve Value** | {m(final_income_sleeve)} |
+        | **Div Growth Sleeve Value** | {m(final_dvg)} |
+        | **Total Income Collected** | {m(total_income_paid)} |
+        | **Avg Monthly Paycheck** | {m(avg_monthly)} |
+        | **Lowest Monthly Paycheck** | {m(income_min)} |
         | **Income Variability (CV)** | {fmt_pct(income_cv)} |
-        | **Reservoir Buffer** | {fmt_money(reservoir_bal)} |
-        | **Total Wealth Created** | {fmt_money(final_total + total_income_paid)} |
+        | **Reservoir Buffer** | {m(reservoir_bal)} |
+        | **Total Wealth Created** | {m(final_total + total_income_paid)} |
         | **Total Return** | {fmt_pct(total_return)} |
         """
+    )
+
+
+    # =================================================================
+    # TEAR SHEET
+    # =================================================================
+    st.divider()
+    st.header("Strategy Tear Sheet")
+    st.markdown("*One-page performance summary — institutional format*")
+
+    # --- Compute risk & performance metrics ---
+    # Daily portfolio returns (total portfolio + income paid out)
+    total_wealth = df["total_portfolio_value"] + df["cumulative_income"]
+    daily_returns = total_wealth.pct_change().dropna()
+    daily_returns = daily_returns.replace([np.inf, -np.inf], 0)
+
+    # SPX benchmark: growth sleeve only (SPY + VTI), for comparison
+    bench = df["growth_value"].pct_change().dropna()
+    bench = bench.replace([np.inf, -np.inf], 0)
+
+    rf_daily = 0.05 / 252  # ~5% risk-free rate
+
+    ann_return = (1 + daily_returns.mean()) ** 252 - 1
+    ann_vol = daily_returns.std() * np.sqrt(252)
+    sharpe = (ann_return - 0.05) / ann_vol if ann_vol > 0 else 0
+
+    downside = daily_returns[daily_returns < 0].std() * np.sqrt(252)
+    sortino = (ann_return - 0.05) / downside if downside > 0 else 0
+
+    bench_ann = (1 + bench.mean()) ** 252 - 1
+    beta_cov = np.cov(daily_returns.values[-len(bench):], bench.values[-len(daily_returns):])[0, 1]
+    bench_var = bench.var()
+    beta = beta_cov / bench_var if bench_var > 0 else 1.0
+    alpha = (ann_return - (0.05 + beta * (bench_ann - 0.05))) * 100
+
+    max_dd = dd.min()
+    total_ret = (total_wealth.iloc[-1] - STARTING_CAPITAL) / STARTING_CAPITAL * 100
+    cagr = ((total_wealth.iloc[-1] / STARTING_CAPITAL) ** (1 / years) - 1) * 100
+
+    bench_total_ret = (df["growth_value"].iloc[-1] - gro_init_cap) / gro_init_cap * 100
+    bench_cagr = ((df["growth_value"].iloc[-1] / gro_init_cap) ** (1 / years) - 1) * 100
+    bench_max_dd = gdd.min()
+
+    # --- Tear sheet header ---
+    st.markdown(
+        f"### {fmt_money_md(STARTING_CAPITAL)} → {fmt_money_md(total_wealth.iloc[-1])} "
+        f"(+{total_ret:.1f}%) over {years:.1f} years"
+    )
+
+    # --- Performance table ---
+    st.markdown("#### Performance Metrics")
+    perf_col1, perf_col2 = st.columns(2)
+    with perf_col1:
+        st.markdown("**3-Bucket Strategy**")
+        st.dataframe(pd.DataFrame({
+            "Metric": ["Total Return", "CAGR", "Alpha", "Max Drawdown", "Sharpe", "Sortino",
+                        "Annual Volatility", "Beta"],
+            "Value": [f"+{total_ret:.1f}%", f"+{cagr:.1f}%", f"+{alpha:.1f}%/yr",
+                      f"{max_dd:.1f}%", f"{sharpe:.2f}", f"{sortino:.2f}",
+                      f"{ann_vol * 100:.1f}%", f"{beta:.2f}"]
+        }).set_index("Metric"), use_container_width=True)
+    with perf_col2:
+        st.markdown("**SPY/VTI Benchmark (Buy & Hold)**")
+        st.dataframe(pd.DataFrame({
+            "Metric": ["Total Return", "CAGR", "Alpha", "Max Drawdown", "Sharpe", "Sortino",
+                        "Annual Volatility", "Beta"],
+            "Value": [f"+{bench_total_ret:.1f}%", f"+{bench_cagr:.1f}%", "—",
+                      f"{bench_max_dd:.1f}%", "—", "—",
+                      f"{bench.std() * np.sqrt(252) * 100:.1f}%", "1.00"]
+        }).set_index("Metric"), use_container_width=True)
+
+    # --- Annual Income & Capital Gains table ---
+    st.markdown("#### Annual Income & Capital Gains")
+    df_yr = df.copy()
+    df_yr["year"] = df_yr.index.year
+    tear_rows = []
+    prev_total = STARTING_CAPITAL
+    for yr, grp in df_yr.groupby("year"):
+        yr_income = grp["daily_income"].sum()
+        yr_smooth = smoothed_df.loc[smoothed_df.index.year == yr, "smoothed_income"]
+        yr_smooth_total = yr_smooth.sum() if len(yr_smooth) > 0 else 0
+        yr_smooth_monthly = yr_smooth.mean() if len(yr_smooth) > 0 else 0
+
+        # Growth divs reinvested this year
+        gro_divs_yr = grp["cum_gro_divs"].iloc[-1] - (grp["cum_gro_divs"].iloc[0] if len(grp) > 1 else 0)
+        dvg_divs_yr = grp["cum_dvg_divs"].iloc[-1] - (grp["cum_dvg_divs"].iloc[0] if len(grp) > 1 else 0)
+        reinvested = gro_divs_yr + dvg_divs_yr
+
+        end_total = grp["total_portfolio_value"].iloc[-1]
+        cap_gains = (end_total - prev_total)
+        prev_total = end_total
+
+        tear_rows.append({
+            "Year": int(yr),
+            "Income Divs": fmt_money(yr_income),
+            "Reinvested Divs": fmt_money(reinvested),
+            "Total Income": fmt_money(yr_income + reinvested),
+            "Avg/Mo": fmt_money(yr_smooth_monthly),
+            "Cap Gains": fmt_money(cap_gains),
+            "Total": fmt_money(yr_income + reinvested + cap_gains),
+        })
+
+    # Totals row
+    total_inc_divs = df["cumulative_income"].iloc[-1]
+    total_reinv = results["cum_gro_divs"] + results["cum_dvg_divs"]
+    total_cap = final_total - STARTING_CAPITAL
+    tear_rows.append({
+        "Year": "TOTAL",
+        "Income Divs": fmt_money(total_inc_divs),
+        "Reinvested Divs": fmt_money(total_reinv),
+        "Total Income": fmt_money(total_inc_divs + total_reinv),
+        "Avg/Mo": fmt_money(avg_monthly),
+        "Cap Gains": fmt_money(total_cap),
+        "Total": fmt_money(total_inc_divs + total_reinv + total_cap),
+    })
+    st.dataframe(pd.DataFrame(tear_rows).set_index("Year"), use_container_width=True)
+
+    # --- Summary paragraph ---
+    st.markdown(
+        f"The portfolio generated **{fmt_money_md(total_inc_divs)} in total dividend income** "
+        f"({fmt_money_md(avg_monthly)}/month average) while also growing the capital base by "
+        f"**{fmt_money_md(total_cap)}**. Growth & dividend growth sleeve reinvestment added "
+        f"**{fmt_money_md(total_reinv)}** in compounded returns. "
+        f"Total wealth created: **{fmt_money_md(total_wealth.iloc[-1])}** from "
+        f"**{fmt_money_md(STARTING_CAPITAL)}** starting capital."
     )
 
 
